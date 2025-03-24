@@ -56,7 +56,7 @@ def time_fwd(func, *args, repeats=30, verbose=True, desc="", **kwargs):
     # time_f = benchmark_forward(lambda: graph.replay(), repeats=repeats, verbose=verbose, desc=desc)
     # # return time_f[1].mean
     # return time_f[1]
-    return Timing(do_bench(lambda: func(*args, **kwargs), warmup=5, rep=repeats) * 1e-3)
+    return Timing(do_bench(lambda: func(*args, **kwargs), warmup=3, rep=repeats) * 1e-3)
 
 
 def flops(batch, nheads, seqlen_q, seqlen_k, headdim, headdim_v, causal=False, window_size=(-1, -1)):
@@ -253,6 +253,7 @@ time_b = {}
 # for headdim in [64, 96, 128, 192, 256]:
 for headdim in [128]:
     nheads = dim // headdim
+    # nheads = 128
     # headdim = 64
     # batch_size = 64
     # seqlen = 512
@@ -260,8 +261,11 @@ for headdim in [128]:
     # headdim = 128
     nheads_kv = nheads
     # nheads_kv = nheads // 4
+    # nheads_kv = 1
     headdim_v = headdim
-    # headdim_v = 128
+    # headdim_v = 512
+    has_qv = headdim == 64 and headdim_v == 512
+    # has_qv = False
 
     for batch_size, seqlen in bs_seqlen_vals:
         num_splits = 0
@@ -278,6 +282,7 @@ for headdim in [128]:
         q, k, v = [x.detach().to(dtype).requires_grad_() for x in [q, k, v]]
         v_colmajor = v.detach().transpose(-1, -3).contiguous().transpose(-1, -3).requires_grad_()
         v_fa3 = v if not V_colmajor else v_colmajor
+        qv = torch.randn(batch_size, seqlen_q, nheads, headdim_v, device=device, dtype=dtype_gen) if has_qv else None
         # q = torch.randint(-2, 3, (batch_size, seqlen, nheads, headdim), device=device, dtype=torch.int32).to(dtype)
         # k = torch.randint(-2, 3, (batch_size, seqlen, nheads, headdim), device=device, dtype=torch.int32).to(dtype)
         # v = torch.randint(-2, 3, (batch_size, seqlen, nheads, headdim_v), device=device, dtype=torch.int32).to(dtype)
@@ -305,7 +310,7 @@ for headdim in [128]:
         for causal in [False, True]:
         # for causal in [True]:
             print(f"\n### {headdim = }, {causal = }, {seqlen = } ###")
-            nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen, headdim, headdim_v, causal=causal, window_size=window_size)
+            nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen, headdim if not has_qv else headdim + headdim_v, headdim_v, causal=causal, window_size=window_size)
             if cudnn is not None:
             # if False:
                 if headdim <= 256 and dtype != torch.float8_e4m3fn and headdim == headdim_v:
@@ -354,7 +359,7 @@ for headdim in [128]:
             time.sleep(1)
             if not varlen:
                 # m1 = time_fwd(flash_attn_func_v3, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, cache_leftpad = leftpad_k, page_table=page_table, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3')
-                m1 = time_fwd(flash_attn_func_v3, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3')
+                m1 = time_fwd(flash_attn_func_v3, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, qv=qv, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3')
                 # pytorch_profiler(flash_attn_func_v3, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, page_table=page_table, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa)
             else:
                 m1 = time_fwd(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, window_size=window_size, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3')
@@ -399,7 +404,8 @@ for headdim in [128]:
     # import pickle
     # # with open(f'flash3_attn_time_h100_hdim{headdim}_causal.plk', 'wb') as fp:
     # # with open(f'flash3_attn_time_h100_cudnn_triton_20241208.plk', 'wb') as fp:
-    # with open(f'flash3_attn_time_h100_fa3_20241208.plk', 'wb') as fp:
+    # with open(f'flash3_attn_time_h100_fa3_20250313.plk', 'wb') as fp:
+    # # with open(f'flash3_attn_time_h100_fa3_fp8_20250313.plk', 'wb') as fp:
     # # with open(f'flash3_attn_time_h100_fp8_hdim{headdim}.plk', 'wb') as fp:
     # # with open(f'flash3_attn_time_h100_hdim{headdim}_1031.plk', 'wb') as fp:
     #     pickle.dump((time_f, time_b), fp, protocol=pickle.HIGHEST_PROTOCOL)
