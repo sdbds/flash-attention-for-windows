@@ -10,10 +10,12 @@ import math
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import custom_fwd, custom_bwd
 
 import triton
 import triton.language as tl
+
+from flash_attn.utils.torch import custom_fwd, custom_bwd
+
 
 def triton_autotune_configs():
     # Return configs with a valid warp count for the current device
@@ -41,6 +43,7 @@ def layer_norm_ref(
     dropout_p=0.0,
     rowscale=None,
     prenorm=False,
+    zero_centered_weight=False,
     dropout_mask=None,
     dropout_mask1=None,
     upcast=False,
@@ -54,6 +57,10 @@ def layer_norm_ref(
         x1 = x1.float() if x1 is not None else None
         weight1 = weight1.float() if weight1 is not None else None
         bias1 = bias1.float() if bias1 is not None else None
+    if zero_centered_weight:
+        weight = weight + 1.0
+        if weight1 is not None:
+            weight1 = weight1 + 1.0
     if x1 is not None:
         assert rowscale is None, "rowscale is not supported with parallel LayerNorm"
     if rowscale is not None:
@@ -96,6 +103,7 @@ def rms_norm_ref(
     dropout_p=0.0,
     rowscale=None,
     prenorm=False,
+    zero_centered_weight=False,
     dropout_mask=None,
     dropout_mask1=None,
     upcast=False,
@@ -109,6 +117,10 @@ def rms_norm_ref(
         x1 = x1.float() if x1 is not None else None
         weight1 = weight1.float() if weight1 is not None else None
         bias1 = bias1.float() if bias1 is not None else None
+    if zero_centered_weight:
+        weight = weight + 1.0
+        if weight1 is not None:
+            weight1 = weight1 + 1.0
     if x1 is not None:
         assert rowscale is None, "rowscale is not supported with parallel LayerNorm"
     if rowscale is not None:
@@ -174,6 +186,7 @@ def _layer_norm_fwd_1pass_kernel(
     N,  # number of columns in X
     eps,  # epsilon to avoid division by zero
     dropout_p,  # Dropout probability
+    zero_centered_weight,  # If true, add 1.0 to the weight
     IS_RMS_NORM: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
@@ -244,6 +257,8 @@ def _layer_norm_fwd_1pass_kernel(
     # Normalize and apply linear transformation
     mask = cols < N
     w = tl.load(W + cols, mask=mask).to(tl.float32)
+    if zero_centered_weight:
+        w += 1.0
     if HAS_BIAS:
         b = tl.load(B + cols, mask=mask).to(tl.float32)
     x_hat = (x - mean) * rstd if not IS_RMS_NORM else x * rstd
@@ -252,6 +267,8 @@ def _layer_norm_fwd_1pass_kernel(
     tl.store(Y + cols, y, mask=mask)
     if HAS_W1:
         w1 = tl.load(W1 + cols, mask=mask).to(tl.float32)
+        if zero_centered_weight:
+            w1 += 1.0
         if HAS_B1:
             b1 = tl.load(B1 + cols, mask=mask).to(tl.float32)
         y1 = x_hat * w1 + b1 if HAS_B1 else x_hat * w1
@@ -271,6 +288,7 @@ def _layer_norm_fwd(
     rowscale=None,
     out_dtype=None,
     residual_dtype=None,
+    zero_centered_weight=False,
     is_rms_norm=False,
     return_dropout_mask=False,
     out=None,
@@ -372,6 +390,7 @@ def _layer_norm_fwd(
             N,
             eps,
             dropout_p,
+            zero_centered_weight,
             is_rms_norm,
             BLOCK_N,
             residual is not None,
@@ -443,6 +462,7 @@ def _layer_norm_bwd_kernel(
     N,  # number of columns in X
     eps,  # epsilon to avoid division by zero
     dropout_p,
+    zero_centered_weight,
     rows_per_program,
     IS_RMS_NORM: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -476,10 +496,14 @@ def _layer_norm_bwd_kernel(
     if RECOMPUTE_OUTPUT:
         Y += row_start * stride_y_row
     w = tl.load(W + cols, mask=mask).to(tl.float32)
+    if zero_centered_weight:
+        w += 1.0
     if RECOMPUTE_OUTPUT and HAS_BIAS:
         b = tl.load(B + cols, mask=mask, other=0.0).to(tl.float32)
     if HAS_DY1:
         w1 = tl.load(W1 + cols, mask=mask).to(tl.float32)
+        if zero_centered_weight:
+            w1 += 1.0
     dw = tl.zeros((BLOCK_N,), dtype=tl.float32)
     if HAS_BIAS:
         db = tl.zeros((BLOCK_N,), dtype=tl.float32)
@@ -581,6 +605,7 @@ def _layer_norm_bwd(
     rowscale=None,
     has_residual=False,
     has_x1=False,
+    zero_centered_weight=False,
     is_rms_norm=False,
     x_dtype=None,
     recompute_output=False,
@@ -635,7 +660,9 @@ def _layer_norm_bwd(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
     if N > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
+    # Increasing the multiple (e.g. 8) will allow more thread blocks to be launched and hide the
+    # latency of the gmem reads/writes, but will increase the time of summing up dw / db.
+    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 8
     _dw = torch.empty((sm_count, N), dtype=torch.float32, device=weight.device)
     _db = (
         torch.empty((sm_count, N), dtype=torch.float32, device=bias.device)
@@ -679,6 +706,7 @@ def _layer_norm_bwd(
             N,
             eps,
             dropout_p,
+            zero_centered_weight,
             rows_per_program,
             is_rms_norm,
             BLOCK_N,
@@ -719,6 +747,7 @@ class LayerNormFn(torch.autograd.Function):
         rowscale=None,
         prenorm=False,
         residual_in_fp32=False,
+        zero_centered_weight=False,
         is_rms_norm=False,
         return_dropout_mask=False,
         out=None,
@@ -770,6 +799,7 @@ class LayerNormFn(torch.autograd.Function):
             dropout_p=dropout_p,
             rowscale=rowscale,
             residual_dtype=residual_dtype,
+            zero_centered_weight=zero_centered_weight,
             is_rms_norm=is_rms_norm,
             return_dropout_mask=return_dropout_mask,
             out=out,
@@ -786,6 +816,7 @@ class LayerNormFn(torch.autograd.Function):
         ctx.has_x1 = x1 is not None
         ctx.prenorm = prenorm
         ctx.x_dtype = x.dtype
+        ctx.zero_centered_weight = zero_centered_weight
         y = y.reshape(x_shape_og)
         y1 = y1.reshape(x_shape_og) if y1 is not None else None
         residual_out = residual_out.reshape(x_shape_og) if residual_out is not None else None
@@ -850,6 +881,7 @@ class LayerNormFn(torch.autograd.Function):
             rowscale,
             ctx.has_residual,
             ctx.has_x1,
+            ctx.zero_centered_weight,
             ctx.is_rms_norm,
             x_dtype=ctx.x_dtype,
         )
@@ -861,6 +893,7 @@ class LayerNormFn(torch.autograd.Function):
             dx1.reshape(ctx.x_shape_og) if dx1 is not None else None,
             dw1,
             db1,
+            None,
             None,
             None,
             None,
@@ -886,6 +919,7 @@ def layer_norm_fn(
     rowscale=None,
     prenorm=False,
     residual_in_fp32=False,
+    zero_centered_weight=False,
     is_rms_norm=False,
     return_dropout_mask=False,
     out=None,
@@ -904,6 +938,7 @@ def layer_norm_fn(
         rowscale,
         prenorm,
         residual_in_fp32,
+        zero_centered_weight,
         is_rms_norm,
         return_dropout_mask,
         out,
@@ -924,6 +959,7 @@ def rms_norm_fn(
     rowscale=None,
     prenorm=False,
     residual_in_fp32=False,
+    zero_centered_weight=False,
     return_dropout_mask=False,
     out=None,
     residual_out=None
@@ -941,6 +977,7 @@ def rms_norm_fn(
         rowscale,
         prenorm,
         residual_in_fp32,
+        zero_centered_weight,
         True,
         return_dropout_mask,
         out,
@@ -950,7 +987,8 @@ def rms_norm_fn(
 
 class RMSNorm(torch.nn.Module):
 
-    def __init__(self, hidden_size, eps=1e-5, dropout_p=0.0, device=None, dtype=None):
+    def __init__(self, hidden_size, eps=1e-5, dropout_p=0.0, zero_centered_weight=False,
+                 device=None, dtype=None):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps
@@ -958,12 +996,16 @@ class RMSNorm(torch.nn.Module):
             self.drop = torch.nn.Dropout(dropout_p)
         else:
             self.drop = None
+        self.zero_centered_weight = zero_centered_weight
         self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
         self.register_parameter("bias", None)
         self.reset_parameters()
 
     def reset_parameters(self):
-        torch.nn.init.ones_(self.weight)
+        if not self.zero_centered_weight:
+            torch.nn.init.ones_(self.weight)
+        else:
+            torch.nn.init.zeros_(self.weight)
 
     def forward(self, x, residual=None, prenorm=False, residual_in_fp32=False):
         return rms_norm_fn(
@@ -975,6 +1017,7 @@ class RMSNorm(torch.nn.Module):
             dropout_p=self.drop.p if self.drop is not None and self.training else 0.0,
             prenorm=prenorm,
             residual_in_fp32=residual_in_fp32,
+            zero_centered_weight=self.zero_centered_weight,
         )
 
 
@@ -1018,12 +1061,12 @@ class LayerNormLinearFn(torch.autograd.Function):
             norm_bias,
             eps,
             residual,
-            out_dtype=None if not torch.is_autocast_enabled() else torch.get_autocast_gpu_dtype(),
+            out_dtype=None if not torch.is_autocast_enabled() else torch.get_autocast_dtype("cuda"),
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm,
         )
         y = y.reshape(x_shape_og)
-        dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else y.dtype
+        dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled() else y.dtype
         linear_weight = linear_weight.to(dtype)
         linear_bias = linear_bias.to(dtype) if linear_bias is not None else None
         out = F.linear(y.to(linear_weight.dtype), linear_weight, linear_bias)

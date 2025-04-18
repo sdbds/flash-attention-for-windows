@@ -107,9 +107,9 @@ public:
         }
         if constexpr (Varlen && Split) {
             int num_splits_dynamic = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[work_info.bidb] : params.num_splits;
+            is_valid_tile &= work_info.split_idx < num_splits_dynamic;
             // Use the top 16 bits to store num_splits
             work_info.split_idx |= (num_splits_dynamic << 16);
-            is_valid_tile &= work_info.split_idx < num_splits_dynamic;
         }
         work_info.bidb = is_valid_tile ? work_info.bidb : -1;
         return work_info;
@@ -388,7 +388,7 @@ public:
         // If Split, for the purpose of scheduling, we pretend that instead there are
         // (args.num_splits * args.num_head) number of heads.
         assert(args.tile_count_semaphore != nullptr);
-        assert(num_head < (1 << 16));  // We use the top 16 bits to store num_splits & split_idx
+        assert(args.num_head < (1 << 16));  // We use the top 16 bits to store num_splits & split_idx
         assert(!Split || args.num_splits < (1 << 8)); // We use the top 8 bits to store num_splits
         return {args.num_head, args.num_batch,
                 args.qhead_per_khead, args.seqlen,
