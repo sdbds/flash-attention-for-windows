@@ -7,10 +7,11 @@ import torch.nn as nn
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
-import flash_attn_3_cuda
+import flash_attn_3._C # Registers operators with PyTorch
 
 # isort: on
 
+flash_attn_3_cuda = torch.ops.flash_attn_3
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -165,6 +166,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         softcap=0.0,
         deterministic=False,
         num_heads_q=None,
+        sm_margin=0,
     ):
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -195,6 +197,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             window_size=window_size,
             attention_chunk=attention_chunk,
             softcap=softcap,
+            sm_margin=sm_margin,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -205,6 +208,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.ndim = qkv.dim()
+        ctx.sm_margin = sm_margin
         # return out, softmax_lse
         return out
 
@@ -240,6 +244,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.window_size,
             ctx.softcap,
             ctx.deterministic,
+            ctx.sm_margin,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
         return dqkv, None, None, None, None, None, None, None, None, None, None, None
@@ -326,9 +331,9 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.deterministic,
             ctx.sm_margin,
         )
-        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : dout.shape[-1]]
-        dv = dv[..., : dout.shape[-1]]
+        dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : k.shape[-1]]
+        dv = dv[..., : v.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
@@ -428,9 +433,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.deterministic,
             ctx.sm_margin,
         )
-        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : dout.shape[-1]]
-        dv = dv[..., : dout.shape[-1]]
+        dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : k.shape[-1]]
+        dv = dv[..., : v.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
@@ -444,6 +449,7 @@ def flash_attn_qkvpacked_func(
     softcap=0.0,
     deterministic=False,
     num_heads_q=None,
+    sm_margin=0,
 ):
     """dropout_p should be set to 0.0 during evaluation
     If Q, K, V are already stacked into 1 tensor, this function will be faster than
@@ -489,6 +495,7 @@ def flash_attn_qkvpacked_func(
         softcap,
         deterministic,
         num_heads_q,
+        sm_margin,
     )
 
 
