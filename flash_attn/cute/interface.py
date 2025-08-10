@@ -1,11 +1,12 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'd need to install nvidia-cutlass-dsl==4.1.0.dev0.
+# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'd need to install nvidia-cutlass-dsl==4.1.0.
 
 # Supported features:
 # - BF16 & FP16 dtype
 # - noncausal & causal attention
 # - MHA, GQA, MQA
 # - hdim 64, 96, 128.
+# - (hdim_qk, hdim_v) = (192, 128) for Blackwell (i.e. DeepSeek shape)
 # - varlen
 # - sliding window
 # - bwd pass for Ampere (will also run on Hopper/Blackwell, but will be slow)
@@ -61,6 +62,7 @@ def _flash_attn_fwd(
     softcap: Optional[float] = None,
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
+    learnable_sink: Optional[torch.Tensor] = None,
     # m_block_size: int = 128,
     # n_block_size: int = 64,
     # num_threads: int = 128,
@@ -97,7 +99,10 @@ def _flash_attn_fwd(
         if t is not None:
             assert t.dtype == torch.int32, "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be int32"
             assert t.stride(0) == 1, "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be contiguous"
-    assert all(t is None or t.is_cuda for t in (q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)), "inputs must be on CUDA device"
+    if learnable_sink is not None:
+        assert learnable_sink.shape == (num_head,)
+        assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
+    assert all(t is None or t.is_cuda for t in (q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
     alignment = 16 // q.element_size()
@@ -119,14 +124,13 @@ def _flash_attn_fwd(
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
-        utils.convert_from_dlpack(
-            t.detach(), leading_dim=t.ndim - 1, divisibility=128 // dtype.width
-        ) for t in (q, k, v, out)
+        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        for t in (q, k, v, out)
     ]
-    lse_tensor = utils.convert_from_dlpack(lse, leading_dim=lse.ndim - 1, alignment=4) if lse is not None else None
-    cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor = [
+    lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1) if lse is not None else None
+    cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor, additive_sink_tensor = [
         from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None
-        for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
     ]
     if causal:
         window_size_right = 0
@@ -148,11 +152,13 @@ def _flash_attn_fwd(
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
         window_size_left is not None, window_size_right is not None,
+        learnable_sink is not None,
         m_block_size, n_block_size, num_threads,
         compute_capability,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
+            assert learnable_sink is None, "Sm90 doesn't support additive sink"
             # fa_fwd = FlashAttentionForwardSm80(
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,
@@ -184,12 +190,12 @@ def _flash_attn_fwd(
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
             cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
-            softcap, window_size_left, window_size_right,
+            softcap, window_size_left, window_size_right, additive_sink_tensor,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
         cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
-        softcap, window_size_left, window_size_right,
+        softcap, window_size_left, window_size_right, additive_sink_tensor,
     )
     return out, lse
 
@@ -260,18 +266,17 @@ def _flash_attn_bwd(
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
-        utils.convert_from_dlpack(
-            t.detach(), leading_dim=3, divisibility=128 // dtype.width
-        ) for t in (q, k, v, out, dout, dq, dk, dv)
+        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        for t in (q, k, v, out, dout, dq, dk, dv)
     ]
-    lse_tensor = utils.convert_from_dlpack(lse.detach(), leading_dim=2, alignment=4)
+    lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=2)
     dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
-        utils.convert_from_dlpack(t.detach(), leading_dim=2, divisibility=128 // cutlass.Float32.width)
+        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=2)
         for t in (dq_accum, dpsum, lse_log2)
     ]
     if qhead_per_kvhead > 1:
         dk_accum_tensor, dv_accum_tensor = [
-            utils.convert_from_dlpack(t.detach(), leading_dim=2, divisibility=128 // cutlass.Float32.width)
+            from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=2)
             for t in (dk_accum, dv_accum)
         ]
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -393,6 +398,7 @@ class FlashAttnFunc(torch.autograd.Function):
         softmax_scale: Optional[float] = None,
         causal: bool = False,
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+        learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
     ):
         out, lse = _flash_attn_fwd(
@@ -403,6 +409,7 @@ class FlashAttnFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
+            learnable_sink=learnable_sink,
             softcap=softcap,
         )
         ctx.save_for_backward(q, k, v, out, lse)
@@ -426,7 +433,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.softcap,
         )
-        return dq, dk, dv, *((None,) * 4)
+        return dq, dk, dv, *((None,) * 5)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -444,6 +451,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         softmax_scale: Optional[float] = None,
         causal: bool = False,
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+        learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
     ):
         out, lse = _flash_attn_fwd(
@@ -458,6 +466,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
+            learnable_sink=learnable_sink,
             softcap=softcap,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -482,6 +491,7 @@ def flash_attn_func(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
 ):
     return FlashAttnFunc.apply(
@@ -491,6 +501,7 @@ def flash_attn_func(
         softmax_scale,
         causal,
         window_size,
+        learnable_sink,
         softcap,
     )
 
@@ -506,6 +517,7 @@ def flash_attn_varlen_func(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
 ):
     return FlashAttnVarlenFunc.apply(
@@ -519,5 +531,6 @@ def flash_attn_varlen_func(
         softmax_scale,
         causal,
         window_size,
+        learnable_sink,
         softcap,
     )
