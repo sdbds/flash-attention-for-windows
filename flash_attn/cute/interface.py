@@ -57,6 +57,7 @@ def _flash_attn_fwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     softcap: Optional[float] = None,
@@ -69,6 +70,7 @@ def _flash_attn_fwd(
     m_block_size: int = 128,
     n_block_size: int = 128,
     num_threads: int = 384,
+    pack_gqa: Optional[bool] = None,
     _compute_capability: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
@@ -80,11 +82,26 @@ def _flash_attn_fwd(
         batch_size = cu_seqlens_q.shape[0] - 1
         seqlen_q = None
         total_q = q.shape[0]
-    seqlen_k, num_head_kv, _ = k.shape[-3:]
+    if page_table is not None:
+        assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
+        assert page_table.dtype == torch.int32, "page_table must be int32"
+        assert page_table.stride(-1) == 1, "page_table must be contiguous in the last dimension"
+        max_num_pages_per_seq = page_table.shape[1]
+        assert page_table.shape == (batch_size, max_num_pages_per_seq)
+        num_pages, page_size = k.shape[:2]
+        seqlen_k = num_pages * page_size
+    else:
+        num_pages, page_size = None, None
+        seqlen_k = k.shape[-3]
+    num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
     if cu_seqlens_k is None:
-        assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
-        assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+        if page_table is None:
+            assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
+            assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+        else:
+            assert k.shape == (num_pages, page_size, num_head_kv, head_dim)
+            assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
     else:
         assert k.shape == (seqlen_k, num_head_kv, head_dim)
         assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
@@ -102,7 +119,7 @@ def _flash_attn_fwd(
     if learnable_sink is not None:
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
-    assert all(t is None or t.is_cuda for t in (q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)), "inputs must be on CUDA device"
+    assert all(t is None or t.is_cuda for t in (q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table, learnable_sink)), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
     alignment = 16 // q.element_size()
@@ -113,6 +130,8 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
+    if pack_gqa is None:
+        pack_gqa = qhead_per_kvhead > 1
 
     out_torch_dtype = q.dtype
     device = q.device
@@ -132,6 +151,7 @@ def _flash_attn_fwd(
         from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
     ]
+    page_table_tensor = from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1) if page_table is not None else None
     if causal:
         window_size_right = 0
     local = window_size_left is not None or window_size_right is not None
@@ -147,17 +167,23 @@ def _flash_attn_fwd(
     if compute_capability == 9:  # TODO: tune block size according to hdim
         if not causal and not local:
             n_block_size = 192
+    if compute_capability == 10:
+        # TODO: fix the varlen case
+        if pack_gqa and (128 % qhead_per_kvhead != 0) or (cu_seqlens_q is not None or seqused_q is not None):
+            pack_gqa = False
 
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
+        page_table is not None,
         window_size_left is not None, window_size_right is not None,
         learnable_sink is not None,
-        m_block_size, n_block_size, num_threads,
+        m_block_size, n_block_size, num_threads, pack_gqa,
         compute_capability,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
+            assert page_table is None, "paged KV not supported on SM 9.0"
             assert learnable_sink is None, "Sm90 doesn't support additive sink"
             # fa_fwd = FlashAttentionForwardSm80(
             fa_fwd = FlashAttentionForwardSm90(
@@ -167,7 +193,7 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
-                pack_gqa=False,
+                pack_gqa=pack_gqa,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 # num_stages=1,
@@ -176,12 +202,14 @@ def _flash_attn_fwd(
                 Q_in_regs=False,
             )
         elif compute_capability == 10:
+            assert page_size in [None, 128], "Only page_size=128 is supported for paged KV on SM 10.0"
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
+                qhead_per_kvhead=qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
-                qhead_per_kvhead=qhead_per_kvhead,
+                pack_gqa=pack_gqa,
                 is_persistent=not causal and not local and cu_seqlens_q is None and seqused_q is None,
             )
         else:
@@ -190,11 +218,13 @@ def _flash_attn_fwd(
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
             cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
+            page_table_tensor,
             softcap, window_size_left, window_size_right, additive_sink_tensor,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
         cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
+        page_table_tensor,
         softcap, window_size_left, window_size_right, additive_sink_tensor,
     )
     return out, lse
@@ -400,6 +430,7 @@ class FlashAttnFunc(torch.autograd.Function):
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
+        pack_gqa: Optional[bool] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -411,6 +442,7 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             learnable_sink=learnable_sink,
             softcap=softcap,
+            pack_gqa=pack_gqa,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -446,13 +478,15 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         v: torch.Tensor,
         cu_seqlens_q: Optional[torch.Tensor],
         cu_seqlens_k: Optional[torch.Tensor],
-        seqused_q: Optional[torch.Tensor],
-        seqused_k: Optional[torch.Tensor],
+        seqused_q: Optional[torch.Tensor] = None,
+        seqused_k: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         causal: bool = False,
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
+        pack_gqa: Optional[bool] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -462,12 +496,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cu_seqlens_k,
             seqused_q,
             seqused_k,
+            page_table=page_table,
             softmax_scale=softmax_scale,
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
             learnable_sink=learnable_sink,
             softcap=softcap,
+            pack_gqa=pack_gqa,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
@@ -493,6 +529,7 @@ def flash_attn_func(
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
+    pack_gqa: Optional[bool] = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -503,6 +540,7 @@ def flash_attn_func(
         window_size,
         learnable_sink,
         softcap,
+        pack_gqa,
     )
 
 
@@ -514,11 +552,13 @@ def flash_attn_varlen_func(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
+    pack_gqa: Optional[bool] = None,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -528,9 +568,11 @@ def flash_attn_varlen_func(
         cu_seqlens_k,
         seqused_q,
         seqused_k,
+        page_table,
         softmax_scale,
         causal,
         window_size,
         learnable_sink,
         softcap,
+        pack_gqa,
     )
