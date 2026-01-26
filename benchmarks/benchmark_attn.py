@@ -22,7 +22,12 @@ from einops import rearrange, repeat
 
 # from flash_attn.utils.benchmark import benchmark_forward, benchmark_backward, benchmark_combined, benchmark_all, benchmark_fwd_bwd, pytorch_profiler
 from flash_attn.cute.benchmark import benchmark_forward, benchmark_backward, benchmark_combined, benchmark_all, benchmark_fwd_bwd, pytorch_profiler
-from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_varlen_func
+
+try:
+    from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_varlen_func
+except ImportError:
+    flash_attn_func = None
+    flash_attn_varlen_func = None
 from flash_attn.cute.interface import flash_attn_func as flash_attn_func_python
 from flash_attn.cute.interface import flash_attn_varlen_func as flash_attn_varlen_func_python
 try:
@@ -320,9 +325,9 @@ for headdim in [128]:
         else:
             page_table = None
 
-        # for causal in [False, True]:
-        for causal in [True]:
-            print(f"\n### {headdim = }, {causal = }, {seqlen = } ###")
+        for causal in [False, True]:
+        # for causal in [True]:
+            print(f"\n### {headdim = }, {causal = }, {seqlen = }, {batch_size = }, {nheads = }, {nheads_kv = }, {varlen = }, {deterministic = } ###")
             nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen, headdim if not has_qv else headdim + headdim_v, headdim_v, causal=causal, window_size=window_size)
             if cudnn is not None:
             # if False:
@@ -390,7 +395,10 @@ for headdim in [128]:
                 #     pytorch_profiler(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, deterministic=deterministic, backward=True)
             # benchmark_forward(torch.clone, k, repeats=repeats, verbose=verbose, desc='Memcpy')
             if dtype != torch.float8_e4m3fn and headdim == headdim_v and flash_attn_func_python is not None and has_backward:
-                _, m1b_py = benchmark_backward(flash_attn_func_python, q, k, v, causal=causal, softcap=softcap, repeats=repeats, verbose=False, desc='Fav2 python')
+                if not varlen:
+                    _, m1b_py = benchmark_backward(flash_attn_func_python, q, k, v, causal=causal, softcap=softcap, deterministic=deterministic, repeats=repeats, verbose=False, desc='Fav4 python')
+                else:
+                    _, m1b_py = benchmark_backward(flash_attn_varlen_func_python, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, causal=causal, softcap=softcap, deterministic=deterministic, repeats=repeats, verbose=False, desc='Fav4 python')
 
             if dtype != torch.float8_e4m3fn and headdim == headdim_v and flash_attn_func is not None:
             # if False:

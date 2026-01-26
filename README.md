@@ -67,6 +67,7 @@ flash_attn_interface.flash_attn_func()
 - CUDA toolkit or ROCm toolkit
 - PyTorch 2.2 and above.
 - `packaging` Python package (`pip install packaging`)
+- `psutil` Python package (`pip install psutil`)
 - `ninja` Python package (`pip install ninja`) *
 - Linux. Might work for Windows starting v2.3.2 (we've seen a few positive [reports](https://github.com/Dao-AILab/flash-attention/issues/595)) but Windows compilation still requires more testing. If you have ideas on how to set up prebuilt CUDA wheels for Windows, please reach out via Github issue.
 
@@ -123,7 +124,7 @@ container from ROCm, which has all the required tools to install FlashAttention.
 
 #### Composable Kernel Backend
 FlashAttention-2 ROCm CK backend currently supports:
-1. MI200 or MI300 GPUs.
+1. MI200x, MI250x, MI300x, and MI355x GPUs.
 2. Datatype fp16 and bf16
 3. Both forward's and backward's head dimensions up to 256.
 
@@ -151,16 +152,12 @@ We are working on the following things
 ##### Getting Started
 To get started with the triton backend for AMD, follow the steps below.
 
-First install the recommended Triton version 
+First install the torch for ROCm from https://pytorch.org/get-started/locally/ if it is not installed. The torch and triton will be installed.   
 
-```
-pip install triton==3.2.0
-```
 Then install Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
 
 ```
 cd flash-attention
-git checkout main_perf
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
 ```
 
@@ -181,15 +178,11 @@ FROM rocm/pytorch:latest
 
 WORKDIR /workspace
 
-# install triton
-RUN pip install triton==3.2.0
-
 # install flash attention
 ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
 
 RUN git clone https://github.com/ROCm/flash-attention.git &&\ 
     cd flash-attention &&\
-    git checkout main_perf &&\
     python setup.py install
 
 # set working dir
