@@ -28,6 +28,7 @@ from flash_attn.cute.block_sparsity import (
     fast_sampling,
     normalize_block_sparse_config,
 )
+from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute import utils
 from mask_mod_definitions import get_mask_pair, random_doc_id_tensor
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
@@ -277,6 +278,7 @@ def _run_mask_test(
 
     # SM90 block-sparse backward expects BlockMask granularity (128, 128) regardless of fwd tiling.
     sparse_tile_m_bwd = sparse_tile_m
+    tile_n_bwd = tile_n
     if COMPUTE_CAPABILITY == 9 and use_block_sparsity and (sparse_tile_m, tile_n) != (128, 128):
         bm_bwd = create_block_mask(
             mask_mod_flex,
@@ -301,6 +303,7 @@ def _run_mask_test(
             *_,
         ) = bm_bwd.as_tuple()
         sparse_tile_m_bwd = 128
+        tile_n_bwd = 128
 
     softmax_scale = 1.0 / math.sqrt(headdim)
 
@@ -323,7 +326,7 @@ def _run_mask_test(
             mask_block_idx=q_mask_idx,
             full_block_cnt=full_q_cnt,
             full_block_idx=full_q_idx,
-            block_size=(sparse_tile_m_bwd, tile_n),
+            block_size=(sparse_tile_m_bwd, tile_n_bwd),
         )
         if use_block_sparsity
         else None
@@ -349,7 +352,7 @@ def _run_mask_test(
         m_block_size=tile_m,
         n_block_size=tile_n,
         pack_gqa=pack_gqa,
-        _compute_capability=None,
+        _arch=None,
         score_mod=None,
         mask_mod=mask_mod_cute,
         block_sparse_tensors=block_sparse_mask_fwd,
@@ -620,7 +623,7 @@ def test_single_doc_bwd_minimal():
         causal=False, softcap=None,
         window_size_left=-1, window_size_right=-1,
         m_block_size=tile_m, n_block_size=tile_n, pack_gqa=False,
-        _compute_capability=None, score_mod=None,
+        _arch=None, score_mod=None,
         mask_mod=mask_mod_cute,
         block_sparse_tensors=block_sparse_mask_fwd,
         return_lse=True, aux_tensors=aux_tensors_arg,
@@ -816,8 +819,8 @@ def test_sm100_block_sparse_q_stage1():
         "__init__",
         wrapped_init,
     ):
-        compile_cache = dict(_flash_attn_fwd.compile_cache)
-        _flash_attn_fwd.compile_cache.clear()
+        compile_cache = _flash_attn_fwd.compile_cache
+        _flash_attn_fwd.compile_cache = get_jit_cache("test_mask_mod.fwd")
         try:
             _run_mask_test(
                 seqlen_q=128,
@@ -837,7 +840,7 @@ def test_sm100_block_sparse_q_stage1():
             )
         finally:
             _flash_attn_fwd.compile_cache.clear()
-            _flash_attn_fwd.compile_cache.update(compile_cache)
+            _flash_attn_fwd.compile_cache = compile_cache
     assert observed.get("q_stage") == 1
 
 
@@ -908,7 +911,7 @@ def test_sm100_block_sparse_coarse_blocks():
         m_block_size=tile_m,
         n_block_size=tile_n,
         pack_gqa=False,
-        _compute_capability=None,
+        _arch=None,
         score_mod=None,
         mask_mod=mask_mod_cute,
         block_sparse_tensors=block_sparse_mask_fwd,
@@ -1015,7 +1018,7 @@ def test_sm100_block_sparse_coarse_blocks_mismatch():
             m_block_size=tile_m,
             n_block_size=tile_n,
             pack_gqa=False,
-            _compute_capability=None,
+            _arch=None,
             score_mod=None,
             mask_mod=mask_mod_cute,
             block_sparse_tensors=block_sparse_mask_fwd,
@@ -1411,6 +1414,62 @@ def test_gqa_expand_stride_zero_bug():
     assert cute_dq_err <= bwd_rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
     assert cute_dk_err <= bwd_rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
     assert cute_dv_err <= bwd_rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 persistent forward only")
+def test_persistent_blocksparse_empty_tiles():
+    """Regression test for persistent forward deadlock with highly-sparse block masks.
+
+    When most Q-tiles are empty (no active KV blocks), the persistent kernel
+    deadlocked due to barrier phase desync in the empty-tile paths of both the
+    softmax and correction warp groups.
+    """
+    torch.manual_seed(5)
+    batch_size, nheads_q, nheads_kv = 2, 16, 1
+    seqlen_q, seqlen_k, headdim = 8192, 128, 128
+    tile_m, tile_n = 128, 128
+    dtype = torch.bfloat16
+
+    sparse_tile_m = 2 * tile_m if COMPUTE_CAPABILITY == 10 else tile_m
+    window_size = 64
+    mask_mod_cute, mask_mod_flex = get_mask_pair(
+        "sliding_window", seqlen_q=seqlen_q, seqlen_k=seqlen_k, window_size=window_size,
+    )
+
+    bm = create_block_mask(
+        mask_mod_flex, batch_size, nheads_q, seqlen_q, seqlen_k,
+        device="cuda", BLOCK_SIZE=(sparse_tile_m, tile_n),
+    )
+    (_, _, kv_mask_cnt, kv_mask_idx, full_kv_cnt, full_kv_idx, *_) = bm.as_tuple()
+    block_sparse_mask_fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt, mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt, full_block_idx=full_kv_idx,
+        block_size=(sparse_tile_m, tile_n),
+    )
+
+    q = torch.randn(batch_size, seqlen_q, nheads_q, headdim, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, headdim, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, headdim, device="cuda", dtype=dtype)
+
+    out, lse = _flash_attn_fwd(
+        q=q, k=k, v=v,
+        out=torch.empty(batch_size, seqlen_q, nheads_q, headdim, device="cuda", dtype=dtype),
+        lse=torch.empty(batch_size, nheads_q, seqlen_q, device="cuda", dtype=torch.float32),
+        cu_seqlens_q=None, cu_seqlens_k=None, seqused_q=None, seqused_k=None,
+        page_table=None, softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False, softcap=None,
+        window_size_left=None, window_size_right=None,
+        learnable_sink=None,
+        m_block_size=tile_m, n_block_size=tile_n,
+        pack_gqa=False, _arch=None,
+        score_mod=None, mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_mask_fwd,
+        return_lse=True, aux_tensors=None,
+    )
+    torch.cuda.synchronize()
+    assert out.shape == (batch_size, seqlen_q, nheads_q, headdim)
+    assert not out.isnan().any()
+
 
 
 if __name__ == "__main__":

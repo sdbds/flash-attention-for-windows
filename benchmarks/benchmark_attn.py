@@ -42,8 +42,29 @@ if torch.cuda.get_device_capability()[0] != 9:
 # flash_attn_func_v3 = None
 
 flash_attn_func = None
+flash_attn_func_python = None
 
 from triton.testing import do_bench
+
+
+attention_ref_mask_cache = {}
+
+def attention_ref(q, k, v, causal=False):
+    softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    scores = torch.einsum('bthd,bshd->bhts', q * softmax_scale, k)
+    if causal:
+        if scores.shape[-2] not in attention_ref_mask_cache:
+            mask = torch.tril(torch.ones(scores.shape[-2:], device=scores.device, dtype=torch.bool), diagonal=0)
+            attention_ref_mask_cache[scores.shape[-2]] = mask
+        else:
+            mask = attention_ref_mask_cache[scores.shape[-2]]
+        scores = scores.masked_fill(mask, float('-inf'))
+    attn = torch.softmax(scores, dim=-1)
+    return torch.einsum('bhts,bshd->bthd', attn, v)
+
+
+attention_ref = None  # Disable the benchmarking for now
+
 
 def time_fwd(func, *args, repeats=30, verbose=True, desc="", **kwargs):
     # # Warmup
@@ -263,6 +284,8 @@ time_b = {}
 # for headdim in [64, 96, 128]:
 # for headdim in [64, 128, 256]:
 # for headdim in [64, 96, 128, 192, 256]:
+# for headdim in [64, 128, 192]:
+# for headdim in [192]:
 for headdim in [128]:
     # nheads = dim // headdim
     nheads = 32 if headdim <= 64 else 16 if headdim <= 192 else 8
@@ -333,22 +356,28 @@ for headdim in [128]:
             # if False:
                 if headdim <= 256 and dtype != torch.float8_e4m3fn:
                     cudnn_spda = cudnn_spda_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=causal, window_size_left=window_size[0])
-                    if has_backward and headdim == headdim_v:
+                    if has_backward:
                         cudnn_spda_bwd = cudnn_spda_bwd_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), o.transpose(1, 2), g.transpose(1, 2), stats.transpose(1, 2), causal=causal, window_size_left=window_size[0])
+            if dtype != torch.float8_e4m3fn and attention_ref is not None:
+                ms = time_fwd(attention_ref, q, k, v, causal=causal, repeats=repeats, verbose=verbose, desc='Standard')
+                time_f[(causal, headdim, batch_size, seqlen), "Standard"] = ms.mean
+                if has_backward:
+                    time.sleep(1)
+                    _, msb = benchmark_backward(attention_ref, q, k, v, causal=causal, repeats=repeats, verbose=False, desc='Standard')
+                    time_b[(causal, headdim, batch_size, seqlen), "Standard"] = msb.mean
             if dtype != torch.float8_e4m3fn and headdim == headdim_v and flash_attn_func is not None:
-            # if False:
                 if not varlen:
-                    m0 = time_fwd(flash_attn_func, q, k, v, dropout_p, causal=causal, window_size=window_size, softcap=softcap, repeats=repeats, verbose=verbose, desc='Fav2')
+                    m0 = time_fwd(flash_attn_func, q, k, v, dropout_p, causal=causal, window_size=window_size_fa, softcap=softcap, repeats=repeats, verbose=verbose, desc='Fav2')
                 else:
-                    m0 = time_fwd(flash_attn_varlen_func, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, dropout_p, causal=causal, window_size=window_size, softcap=softcap, repeats=repeats, verbose=verbose, desc='Fav2')
+                    m0 = time_fwd(flash_attn_varlen_func, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, dropout_p, causal=causal, window_size=window_size_fa, softcap=softcap, repeats=repeats, verbose=verbose, desc='Fav2')
                 time_f[(causal, headdim, batch_size, seqlen), "Flash2"] = m0.mean
                 if has_backward:
                     time.sleep(1)
                     if not varlen:
-                        _, m0b = benchmark_backward(flash_attn_func, q, k, v, dropout_p, causal=causal, window_size=window_size, softcap=softcap, deterministic=deterministic,
+                        _, m0b = benchmark_backward(flash_attn_func, q, k, v, dropout_p, causal=causal, window_size=window_size_fa, softcap=softcap, deterministic=deterministic,
                                                     repeats=repeats, verbose=False, desc='Fav2')
                     else:
-                        _, m0b = benchmark_backward(flash_attn_varlen_func, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, dropout_p, causal=causal, window_size=window_size, softcap=softcap, deterministic=deterministic,
+                        _, m0b = benchmark_backward(flash_attn_varlen_func, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, dropout_p, causal=causal, window_size=window_size_fa, softcap=softcap, deterministic=deterministic,
                                                     repeats=repeats, verbose=False, desc='Fav2')
                     time_b[(causal, headdim, batch_size, seqlen), "Flash2"] = m0b.mean
             # pytorch_profiler(flash_attn_func, q, k, v, dropout_p, causal=causal, backward=True)
@@ -394,12 +423,16 @@ for headdim in [128]:
                 # else:
                 #     pytorch_profiler(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, deterministic=deterministic, backward=True)
             # benchmark_forward(torch.clone, k, repeats=repeats, verbose=verbose, desc='Memcpy')
-            if dtype != torch.float8_e4m3fn and headdim == headdim_v and flash_attn_func_python is not None and has_backward:
+            if dtype != torch.float8_e4m3fn and flash_attn_func_python is not None and has_backward:
                 if not varlen:
                     _, m1b_py = benchmark_backward(flash_attn_func_python, q, k, v, causal=causal, softcap=softcap, deterministic=deterministic, repeats=repeats, verbose=False, desc='Fav4 python')
                 else:
                     _, m1b_py = benchmark_backward(flash_attn_varlen_func_python, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, causal=causal, softcap=softcap, deterministic=deterministic, repeats=repeats, verbose=False, desc='Fav4 python')
 
+            if dtype != torch.float8_e4m3fn and attention_ref is not None:
+                print(f'Standard fwd: {ms.mean * 1e3:.3f}ms, {(nFLOPS / ms.mean * 1e-12):.1f} TFLOPS')
+                if has_backward:
+                    print(f'Standard bwd: {msb.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / msb.mean * 1e-12):.1f} TFLOPS')
             if dtype != torch.float8_e4m3fn and headdim == headdim_v and flash_attn_func is not None:
             # if False:
                 print(f'FAv2 fwd: {m0.mean * 1e3:.3f}ms, {(nFLOPS / m0.mean * 1e-12):.1f} TFLOPS')
@@ -416,5 +449,5 @@ for headdim in [128]:
 
             if flash_attn_func_python is not None:
                 print(f'FA Python fwd: {m1_py.mean * 1e3:.3f}ms, {(nFLOPS / m1_py.mean * 1e-12):.1f} TFLOPS')
-                if dtype != torch.float8_e4m3fn and headdim == headdim_v and has_backward:
+                if dtype != torch.float8_e4m3fn and has_backward:
                     print(f'FA Python bwd: {m1b_py.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m1b_py.mean * 1e-12):.1f} TFLOPS')
