@@ -8,6 +8,7 @@ import re
 import ast
 import glob
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Literal, Optional
 from packaging.version import parse, Version
@@ -199,12 +200,18 @@ def rename_cpp_to_cu(cpp_files):
 
 def validate_and_update_archs(archs):
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx950", "gfx942"]
+    allowed_archs = ["native", "gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
         arch in allowed_archs for arch in archs
-    ), f"One of GPU archs of {archs} is invalid or not supported by Flash-Attention"
+    ), f"Invalid archs: {archs}. Allowed: {allowed_archs}"
+
+    if "native" in archs and len(archs) > 1:
+        raise ValueError(
+            f"'native' cannot be combined with explicit archs: {archs}. "
+            "Use either GPU_ARCHS='native' or GPU_ARCHS='gfx942;gfx950'."
+        )
 
 
 cmdclass = {}
@@ -397,10 +404,35 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             os.makedirs("build")
 
         optdim = os.getenv("OPT_DIM", "32,64,128,256")
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+        archs = [arch.lower() for arch in os.getenv("GPU_ARCHS", "native").split(";")]
+        validate_and_update_archs(archs)
+
+        if archs != ["native"]:
+            kernel_targets = archs
+        else:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "GPU_ARCHS not set and no GPU detected. "
+                    "Please set GPU_ARCHS (e.g. GPU_ARCHS='gfx942') to cross-compile."
+                )
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            gcn_arch = getattr(props, "gcnArchName", None)
+            if not gcn_arch:
+                raise RuntimeError(
+                    "GPU_ARCHS not set and current device does not expose gcnArchName. "
+                    "This usually means the active PyTorch build is not ROCm. "
+                    "Please set GPU_ARCHS explicitly."
+                )
+            detected_arch = gcn_arch.split(":")[0]
+            kernel_targets = [detected_arch.lower()]
+            validate_and_update_archs(kernel_targets)
+
+        # NOTE: --targets requires CK >= 859acb5 (the submodule version pinned in this repo).
+        # If generate.py fails with an unknown argument error, ensure the
+        # composable_kernel submodule is up to date.
+        targets_arg = ",".join(kernel_targets)
+        for direction in ["fwd", "fwd_appendkv", "fwd_splitkv", "bwd"]:
+            subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", direction, "--output_dir", "build", "--receipt", "2", "--optdim", optdim, "--targets", targets_arg], check=True)
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
@@ -410,14 +442,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             generator_flag = ["-DOLD_GENERATOR_PATH"]
 
         check_if_rocm_home_none("flash_attn")
-        archs = os.getenv("GPU_ARCHS", "native").split(";")
-        validate_and_update_archs(archs)
-
-        if archs != ['native']:
-            cc_flag = [f"--offload-arch={arch}" for arch in archs]
-        else:
-            arch = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
-            cc_flag = [f"--offload-arch={arch}"]
+        cc_flag = [f"--offload-arch={arch}" for arch in kernel_targets]
 
         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
         # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -468,7 +493,11 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                     # "-DFLASHATTENTION_DISABLE_BACKWARD",
                     "-D__HIP_PLATFORM_HCC__=1"]
 
-        cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 3)}"]
+        ck_tile_float_to_bfloat16_default = os.environ.get("CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT")
+        if ck_tile_float_to_bfloat16_default is None:
+            has_gfx11_target = any(arch.startswith("gfx11") for arch in kernel_targets)
+            ck_tile_float_to_bfloat16_default = "0" if has_gfx11_target else "3"
+        cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={ck_tile_float_to_bfloat16_default}"]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = get_hip_version()
@@ -533,9 +562,14 @@ def get_wheel_url():
         # We're using the CUDA version used to build torch, not the one currently installed
         # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
         torch_cuda_version = parse(torch.version.cuda)
-        # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.3
+        # For CUDA 11 we compile for 11.8, for CUDA 12 for 12.3, and for CUDA 13 for 13.0
         # to save CI time. Minor versions should be compatible.
-        torch_cuda_version = parse("11.8") if torch_cuda_version.major == 11 else parse("12.3")
+        if torch_cuda_version.major == 11:
+            torch_cuda_version = parse("11.8")
+        elif torch_cuda_version.major == 12:
+            torch_cuda_version = parse("12.3")
+        else:
+            torch_cuda_version = parse("13.0")
         # cuda_version = f"{cuda_version_raw.major}{cuda_version_raw.minor}"
         cuda_version = f"{torch_cuda_version.major}"
 
@@ -609,13 +643,42 @@ class NinjaBuildExtension(BuildExtension):
 
         super().__init__(*args, **kwargs)
 
+    def build_extensions(self) -> None:
+        original_spawn = None
+        if sys.platform == "win32" and self.compiler.compiler_type == "msvc":
+            original_spawn = self.compiler.spawn
+
+            def spawn(cmd):
+                if not cmd or Path(str(cmd[0])).name.lower() != "link.exe":
+                    return original_spawn(cmd)
+                cmd = [str(arg) for arg in cmd]
+                if len(subprocess.list2cmdline(cmd)) <= 32767:
+                    return original_spawn(cmd)
+                # Temporary workaround adapted from https://github.com/pypa/distutils/pull/406
+                # until setuptools/distutils ships response-file handling for long MSVC links.
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    rsp_path = Path(tmpdir) / "cmdline.txt"
+                    rsp_path.write_text(
+                        "\n".join(subprocess.list2cmdline([arg]) for arg in cmd[1:]) + "\n",
+                        encoding="ascii",
+                    )
+                    return original_spawn([cmd[0], f"@{rsp_path}"])
+
+            self.compiler.spawn = spawn
+
+        try:
+            super().build_extensions()
+        finally:
+            if original_spawn is not None:
+                self.compiler.spawn = original_spawn
+
 
 # Build install_requires based on platform
 if ROCM_BACKEND == "triton":
     # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
     install_requires = [
         "einops",
-        "triton==3.5.1",
+        "triton>=3.6.0" if sys.platform != "win32" else "triton-windows>=3.6.0",
     ]
 else:
     install_requires = [
