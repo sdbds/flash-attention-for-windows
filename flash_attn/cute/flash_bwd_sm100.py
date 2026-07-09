@@ -485,7 +485,9 @@ class FlashAttentionBackwardSm100:
             assert self.dk_dtype.width == 32, "Must accumulate dK in float precision for GQA"
             assert self.dv_dtype.width == 32, "Must accumulate dV in float precision for GQA"
 
-        mdQaccum, mdK, mdV = [assume_tensor_aligned(t) for t in (mdQaccum, mdK, mdV)]
+        mdQaccum, mdK, mdV, mLSE, mdPsum = [
+            assume_tensor_aligned(t) for t in (mdQaccum, mdK, mdV, mLSE, mdPsum)
+        ]
 
         # (b, s, n, h) --> (s, h, n, b) or (t, n, h) -> (t, h, n)
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
@@ -782,7 +784,7 @@ class FlashAttentionBackwardSm100:
                     cutlass.Int64, self.dQaccum_reduce_stage // 2
                 ]
                 tmem_holding_buf: Int32
-                tmem_dealloc_mbar_ptr: cutlass.Int64
+                tmem_dealloc_mbar: cutlass.Int64
 
                 # 2-CTA
                 Qt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
@@ -861,7 +863,7 @@ class FlashAttentionBackwardSm100:
                     cutlass.Int64, self.dQaccum_reduce_stage // 2
                 ]
                 tmem_holding_buf: Int32
-                tmem_dealloc_mbar_ptr: Int64
+                tmem_dealloc_mbar: Int64
 
                 sQ: cute.struct.Align[
                     cute.struct.MemRange[cute.Uint8, sQ_alloc_bytes],
@@ -1152,11 +1154,11 @@ class FlashAttentionBackwardSm100:
             * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
         )
         tmem = cutlass.utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
 
         # UMMA producers and AsyncThread consumers
